@@ -1,0 +1,191 @@
+name: BigFrame contact form end-to-end test
+
+on:
+  push:
+    paths:
+      - .github/workflows/bigframe-contact-form-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-contact-form:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4
+
+      - name: Inspect and submit the public contact form once
+        env:
+          TEST_TOKEN: BF-FORM-20260904-GHA-${{ github.run_id }}
+        run: |
+          cat > /tmp/test_form.py <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          PAGE_URL = "https://bigframe.jp/inq/"
+          token = os.environ["TEST_TOKEN"]
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36 BigFrameFormHealthCheck/1.0",
+              "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+          }
+
+          session = requests.Session()
+          session.headers.update(headers)
+          response = session.get(PAGE_URL, timeout=30)
+          print(f"GET status={response.status_code} final_url={response.url}")
+          response.raise_for_status()
+
+          soup = BeautifulSoup(response.text, "html.parser")
+          forms = soup.find_all("form")
+          print(f"forms_found={len(forms)}")
+          form = None
+          for candidate in forms:
+              marker = " ".join([
+                  str(candidate.get("id", "")),
+                  " ".join(candidate.get("class", [])),
+                  str(candidate.get("data-formid", "")),
+              ]).lower()
+              if "wpforms" in marker:
+                  form = candidate
+                  break
+          if form is None and forms:
+              form = forms[0]
+          if form is None:
+              print("ERROR: no form element found")
+              sys.exit(2)
+
+          action_url = urljoin(response.url, form.get("action") or response.url)
+          method = (form.get("method") or "post").lower()
+          print(f"selected_form_id={form.get('id')} class={form.get('class')} method={method} action={action_url}")
+          print("form_data_attributes=" + json.dumps({k: v for k, v in form.attrs.items() if k.startswith("data-")}, ensure_ascii=False))
+
+          payload = {}
+          field_manifest = []
+
+          def infer_value(name, element_id, placeholder, input_type):
+              haystack = " ".join([name or "", element_id or "", placeholder or ""]).lower()
+              if input_type == "email" or "mail" in haystack:
+                  return "info@bigframe.jp"
+              if input_type == "tel" or any(key in haystack for key in ["phone", "tel", "電話"]):
+                  return "070-4495-8161"
+              if any(key in haystack for key in ["name", "名前", "氏名"]):
+                  return "BigFrameフォーム動作確認"
+              return f"動作確認 {token}"
+
+          for element in form.find_all(["input", "textarea", "select", "button"]):
+              tag = element.name
+              name = element.get("name")
+              if not name:
+                  continue
+              input_type = (element.get("type") or "").lower()
+              element_id = element.get("id") or ""
+              placeholder = element.get("placeholder") or ""
+
+              if tag == "input":
+                  if input_type in {"submit", "button", "image", "file", "reset"}:
+                      if input_type == "submit" and element.get("value"):
+                          payload[name] = element.get("value")
+                      continue
+                  if input_type in {"checkbox", "radio"}:
+                      if name not in payload and not element.has_attr("disabled"):
+                          payload[name] = element.get("value", "1")
+                      continue
+                  if input_type == "hidden":
+                      payload[name] = element.get("value", "")
+                  else:
+                      payload[name] = infer_value(name, element_id, placeholder, input_type)
+              elif tag == "textarea":
+                  payload[name] = (
+                      "【自動動作確認・対応不要】公開お問い合わせフォームの機能確認です。"
+                      f"識別子: {token}。実際の問い合わせではありません。"
+                  )
+              elif tag == "select":
+                  options = element.find_all("option")
+                  selected = next((o for o in options if o.has_attr("selected") and o.get("value", "") != ""), None)
+                  if selected is None:
+                      selected = next((o for o in options if o.get("value", "") != "" and not o.has_attr("disabled")), None)
+                  if selected is not None:
+                      payload[name] = selected.get("value", selected.get_text(strip=True))
+              elif tag == "button" and input_type == "submit" and element.get("value"):
+                  payload[name] = element.get("value")
+
+              field_manifest.append({
+                  "tag": tag,
+                  "type": input_type,
+                  "name": name,
+                  "id": element_id,
+                  "required": element.has_attr("required") or element.get("aria-required") == "true",
+              })
+
+          # Prefer email for a contact-method radio/select when a matching value exists.
+          for radio in form.find_all("input", {"type": "radio"}):
+              name = radio.get("name")
+              value = radio.get("value", "")
+              label_text = ""
+              if radio.get("id"):
+                  label = form.find("label", attrs={"for": radio.get("id")})
+                  if label:
+                      label_text = label.get_text(" ", strip=True)
+              if name and ("mail" in value.lower() or "メール" in value or "メール" in label_text):
+                  payload[name] = value
+
+          # WPForms AJAX normally adds this client-side. Supplying it is harmless for normal POST.
+          ajax_submit = str(form.get("data-ajax_submit", "")).lower() in {"1", "true", "yes"}
+          if ajax_submit:
+              payload.setdefault("action", "wpforms_submit")
+
+          print("field_manifest=" + json.dumps(field_manifest, ensure_ascii=False))
+          print("payload_keys=" + json.dumps(sorted(payload.keys()), ensure_ascii=False))
+          print(f"ajax_submit={ajax_submit}")
+
+          submit_url = action_url
+          if ajax_submit:
+              # WPForms exposes the AJAX URL in page scripts. Use it when discoverable.
+              ajax_match = re.search(r'ajaxurl["\']?\s*[:=]\s*["\']([^"\']+)', response.text)
+              if ajax_match:
+                  submit_url = urljoin(response.url, ajax_match.group(1).replace(r"\/", "/"))
+              elif "admin-ajax.php" in response.text:
+                  admin_match = re.search(r'https?://[^"\']+/wp-admin/admin-ajax\.php', response.text)
+                  if admin_match:
+                      submit_url = admin_match.group(0)
+              else:
+                  submit_url = urljoin(response.url, "/wp-admin/admin-ajax.php")
+
+          print(f"POST url={submit_url}")
+          post_headers = {"Referer": response.url, "Origin": "https://bigframe.jp"}
+          submitted = session.post(submit_url, data=payload, headers=post_headers, timeout=60, allow_redirects=True)
+          print(f"POST status={submitted.status_code} final_url={submitted.url} content_type={submitted.headers.get('content-type')}")
+          print("response_excerpt=" + re.sub(r"\s+", " ", submitted.text[:4000]))
+
+          body_lower = submitted.text.lower()
+          success_markers = [
+              "wpforms-confirmation",
+              "ありがとうございます",
+              "送信されました",
+              "success\":true",
+              '"success":true',
+          ]
+          error_markers = [
+              "wpforms-error",
+              "送信に失敗",
+              "必須項目",
+              "invalid",
+              '"success":false',
+          ]
+          print("success_markers_found=" + json.dumps([m for m in success_markers if m in body_lower or m in submitted.text], ensure_ascii=False))
+          print("error_markers_found=" + json.dumps([m for m in error_markers if m in body_lower or m in submitted.text], ensure_ascii=False))
+          print(f"TEST_TOKEN={token}")
+
+          if submitted.status_code >= 400:
+              sys.exit(3)
+          PY
+          python /tmp/test_form.py
