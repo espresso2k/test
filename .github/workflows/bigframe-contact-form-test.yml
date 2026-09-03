@@ -1,4 +1,4 @@
-name: BigFrame contact form browser test
+name: BigFrame contact form headed-browser test
 
 on:
   push:
@@ -19,115 +19,82 @@ jobs:
           npm install --no-save playwright
           npx playwright install --with-deps chromium
 
-      - name: Submit and diagnose form 7052
+      - name: Submit form with normal browser interaction
         env:
-          TEST_TOKEN: BF-FORM-20260904-BROWSER-${{ github.run_id }}
+          TEST_TOKEN: BF-FORM-20260904-HEADED-${{ github.run_id }}
         run: |
           cat > test_form.mjs <<'JS'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
 
           const token = process.env.TEST_TOKEN;
-          const browser = await chromium.launch({ headless: true });
-          const context = await browser.newContext({ locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
+          const browser = await chromium.launch({ headless: false });
+          const context = await browser.newContext({
+            locale: 'ja-JP',
+            timezoneId: 'Asia/Tokyo',
+            viewport: { width: 1365, height: 900 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+          });
           const page = await context.newPage();
-          const responses = [];
-
-          page.on('console', msg => console.log(`CONSOLE ${msg.type()}: ${msg.text()}`));
-          page.on('pageerror', err => console.log(`PAGE_ERROR ${err.message}`));
-          page.on('requestfailed', req => console.log(`REQUEST_FAILED ${req.method()} ${req.url()} ${req.failure()?.errorText}`));
-          page.on('response', async response => {
-            if (/admin-ajax\.php|recaptcha|hcaptcha|turnstile/i.test(response.url())) {
+          const ajax = [];
+          page.on('pageerror', e => console.log(`PAGE_ERROR ${e.message}`));
+          page.on('response', async r => {
+            if (r.url().includes('/wp-admin/admin-ajax.php')) {
               let text = '';
-              try { text = (await response.text()).replace(/\s+/g, ' ').slice(0, 2500); } catch {}
-              const line = `${response.status()} ${response.request().method()} ${response.url()} :: ${text}`;
-              responses.push(line);
-              console.log(`FORM_NETWORK ${line}`);
+              try { text = (await r.text()).replace(/\s+/g, ' ').slice(0, 5000); } catch {}
+              ajax.push({ status: r.status(), text });
+              console.log(`AJAX ${r.status()} ${text}`);
             }
           });
 
           try {
-            const nav = await page.goto('https://bigframe.jp/inq/', { waitUntil: 'networkidle', timeout: 60000 });
-            console.log(`NAV status=${nav?.status()} url=${page.url()}`);
-            const form = page.locator('#wpforms-form-7052');
-            await form.waitFor({ state: 'visible', timeout: 30000 });
+            await page.goto('https://bigframe.jp/inq/', { waitUntil: 'networkidle', timeout: 60000 });
+            await page.waitForTimeout(7000);
+            await page.mouse.move(150, 120, { steps: 12 });
+            await page.mouse.wheel(0, 700);
+            await page.waitForTimeout(1800);
 
-            const controls = await form.locator('input,textarea,select,button').evaluateAll(nodes => nodes.map(node => {
-              const container = node.closest('.wpforms-field');
-              const id = node.id || '';
-              const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-              return {
-                tag: node.tagName,
-                id,
-                name: node.getAttribute('name') || '',
-                type: node.getAttribute('type') || '',
-                visible: !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length),
-                required: node.required || node.getAttribute('aria-required') === 'true',
-                label: (label?.innerText || container?.querySelector('label')?.innerText || '').trim(),
-                containerText: (container?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300),
-              };
-            }));
-            console.log(`CONTROLS ${JSON.stringify(controls)}`);
-
-            const fill = async (selector, value) => {
-              const item = page.locator(selector).first();
-              if (await item.count() && await item.isVisible()) {
-                await item.fill(value);
-                console.log(`FILLED ${selector}`);
-              }
+            const type = async (selector, value) => {
+              const el = page.locator(selector);
+              await el.click();
+              await el.pressSequentially(value, { delay: 65 });
+              await page.waitForTimeout(350);
             };
-            await fill('#wpforms-7052-field_1', 'BigFrameフォーム動作確認');
-            await fill('#wpforms-7052-field_6', '合同会社BigFrame');
-            await fill('#wpforms-7052-field_2', '07044958161');
-            await fill('#wpforms-7052-field_3', 'info@bigframe.jp');
-            await fill('#wpforms-7052-field_5', `【自動動作確認・対応不要】識別子: ${token}。実際の問い合わせではありません。`);
+            await type('#wpforms-7052-field_1', 'BigFrameフォーム動作確認');
+            await type('#wpforms-7052-field_2', '07044958161');
+            await type('#wpforms-7052-field_3', 'info@bigframe.jp');
+            await page.locator('#wpforms-7052-field_4_2').check();
+            await type('#wpforms-7052-field_5', `【動作確認・対応不要】識別子 ${token}。実際の問い合わせではありません。`);
+            await page.waitForTimeout(9000);
 
-            const radios = page.locator('input[name="wpforms[fields][4]"]');
-            for (let i = 0; i < await radios.count(); i++) {
-              const radio = radios.nth(i);
-              const id = await radio.getAttribute('id');
-              const value = await radio.getAttribute('value') || '';
-              const labelText = id && await page.locator(`label[for="${id}"]`).count()
-                ? await page.locator(`label[for="${id}"]`).first().innerText() : '';
-              if (/メール|mail/i.test(`${value} ${labelText}`)) {
-                await radio.check();
-                console.log(`RADIO ${value} ${labelText}`);
-                break;
-              }
-            }
+            console.log(`VALID ${await page.locator('#wpforms-form-7052').evaluate(f => f.checkValidity())}`);
+            await page.screenshot({ path: 'before.png', fullPage: true });
+            await page.locator('#wpforms-submit-7052').click();
+            await page.waitForTimeout(18000);
 
-            console.log(`FORM_VALID_BEFORE ${await form.evaluate(el => el.checkValidity())}`);
-            await page.screenshot({ path: 'before-submit.png', fullPage: true });
-            await page.locator('#wpforms-submit-7052').click({ timeout: 30000 });
-            await page.waitForTimeout(15000);
-
-            const confirmations = await page.locator('#wpforms-confirmation-7052, .wpforms-confirmation-container-full, .wpforms-confirmation-container')
-              .evaluateAll(nodes => nodes.filter(n => !!(n.offsetWidth || n.offsetHeight || n.getClientRects().length)).map(n => n.innerText.trim()));
-            const errors = await page.locator('#wpforms-form-7052 .wpforms-error, #wpforms-form-7052 [role="alert"], #wpforms-form-7052 .wpforms-process-error')
-              .evaluateAll(nodes => nodes.filter(n => !!(n.offsetWidth || n.offsetHeight || n.getClientRects().length)).map(n => n.innerText.trim()));
-            const bodyText = (await page.locator('body').innerText()).replace(/\s+/g, ' ').slice(-6000);
-
+            const confirmations = await page.locator('#wpforms-confirmation-7052, .wpforms-confirmation-container')
+              .evaluateAll(nodes => nodes.filter(n => n.offsetParent !== null).map(n => n.innerText.trim()));
+            const errors = await page.locator('#wpforms-form-7052 .wpforms-error, #wpforms-form-7052 [role="alert"]')
+              .evaluateAll(nodes => nodes.filter(n => n.offsetParent !== null).map(n => n.innerText.trim()));
             console.log(`CONFIRMATIONS ${JSON.stringify(confirmations)}`);
             console.log(`ERRORS ${JSON.stringify(errors)}`);
-            console.log(`BODY_TAIL ${bodyText}`);
-            console.log(`RESPONSES ${JSON.stringify(responses)}`);
-            console.log(`TEST_TOKEN ${token}`);
-            await page.screenshot({ path: 'after-submit.png', fullPage: true });
-            fs.writeFileSync('result.json', JSON.stringify({ token, controls, confirmations, errors, bodyText, responses }, null, 2));
+            console.log(`TOKEN ${token}`);
+            await page.screenshot({ path: 'after.png', fullPage: true });
+            fs.writeFileSync('result.json', JSON.stringify({ token, confirmations, errors, ajax }, null, 2));
           } finally {
             await browser.close();
           }
           JS
-          node ./test_form.mjs
+          xvfb-run -a node ./test_form.mjs
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bigframe-form-test-${{ github.run_id }}
+          name: bigframe-form-headed-${{ github.run_id }}
           path: |
-            before-submit.png
-            after-submit.png
+            before.png
+            after.png
             result.json
           if-no-files-found: warn
           retention-days: 7
