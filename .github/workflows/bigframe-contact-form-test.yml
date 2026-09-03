@@ -1,4 +1,4 @@
-name: BigFrame contact form end-to-end test
+name: BigFrame contact form browser test
 
 on:
   push:
@@ -12,180 +12,203 @@ permissions:
 jobs:
   test-contact-form:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Install Python dependencies
-        run: python -m pip install --disable-pip-version-check requests beautifulsoup4
-
-      - name: Inspect and submit the public contact form once
-        env:
-          TEST_TOKEN: BF-FORM-20260904-GHA-${{ github.run_id }}
+      - name: Install Playwright
         run: |
-          cat > /tmp/test_form.py <<'PY'
-          import json
-          import os
-          import re
-          import sys
-          from urllib.parse import urljoin
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
 
-          import requests
-          from bs4 import BeautifulSoup
+      - name: Submit the public form in a real browser
+        env:
+          TEST_TOKEN: BF-FORM-20260904-BROWSER-${{ github.run_id }}
+        run: |
+          cat > /tmp/test_form.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
 
-          PAGE_URL = "https://bigframe.jp/inq/"
-          token = os.environ["TEST_TOKEN"]
-          headers = {
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36 BigFrameFormHealthCheck/1.0",
-              "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+          const token = process.env.TEST_TOKEN;
+          const pageUrl = 'https://bigframe.jp/inq/';
+          const browser = await chromium.launch({ headless: true });
+          const context = await browser.newContext({
+            locale: 'ja-JP',
+            timezoneId: 'Asia/Tokyo',
+            userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36 BigFrameFormHealthCheck/1.0',
+          });
+          const page = await context.newPage();
+
+          const relevantResponses = [];
+          page.on('console', msg => console.log(`BROWSER_CONSOLE ${msg.type()}: ${msg.text()}`));
+          page.on('pageerror', err => console.log(`PAGE_ERROR: ${err.message}`));
+          page.on('requestfailed', req => console.log(`REQUEST_FAILED ${req.method()} ${req.url()} :: ${req.failure()?.errorText}`));
+          page.on('response', async response => {
+            const url = response.url();
+            if (/admin-ajax\.php|wpforms|recaptcha|turnstile|hcaptcha/i.test(url)) {
+              let excerpt = '';
+              try {
+                const text = await response.text();
+                excerpt = text.replace(/\s+/g, ' ').slice(0, 1500);
+              } catch {}
+              const item = `${response.status()} ${response.request().method()} ${url} :: ${excerpt}`;
+              relevantResponses.push(item);
+              console.log(`RELEVANT_RESPONSE ${item}`);
+            }
+          });
+
+          try {
+            const nav = await page.goto(pageUrl, { waitUntil: 'networkidle', timeout: 60000 });
+            console.log(`NAVIGATION status=${nav?.status()} url=${page.url()}`);
+            const form = page.locator('#wpforms-form-7052');
+            await form.waitFor({ state: 'visible', timeout: 30000 });
+
+            const formInfo = await form.evaluate(el => ({
+              id: el.id,
+              className: el.className,
+              action: el.action,
+              method: el.method,
+              attributes: Object.fromEntries([...el.attributes].map(a => [a.name, a.value])),
+            }));
+            console.log(`FORM_INFO ${JSON.stringify(formInfo)}`);
+
+            const controls = await form.locator('input, textarea, select, button').evaluateAll(nodes => nodes.map(node => {
+              const id = node.id || '';
+              const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+              const wrapping = node.closest('label');
+              const container = node.closest('.wpforms-field');
+              return {
+                tag: node.tagName,
+                type: node.getAttribute('type') || '',
+                id,
+                name: node.getAttribute('name') || '',
+                value: node.getAttribute('value') || '',
+                visible: !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length),
+                required: node.required || node.getAttribute('aria-required') === 'true',
+                label: (explicit?.innerText || wrapping?.innerText || container?.querySelector('label')?.innerText || '').trim(),
+                containerText: (container?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+              };
+            }));
+            console.log(`CONTROLS ${JSON.stringify(controls)}`);
+
+            const fillIfVisible = async (selector, value) => {
+              const locator = page.locator(selector);
+              if (await locator.count() && await locator.first().isVisible()) {
+                await locator.first().fill(value);
+                console.log(`FILLED ${selector}`);
+              }
+            };
+
+            await fillIfVisible('#wpforms-7052-field_1', 'BigFrameフォーム動作確認');
+            await fillIfVisible('#wpforms-7052-field_6', '合同会社BigFrame');
+            await fillIfVisible('#wpforms-7052-field_2', '07044958161');
+            await fillIfVisible('#wpforms-7052-field_3', 'info@bigframe.jp');
+            await fillIfVisible(
+              '#wpforms-7052-field_5',
+              `【自動動作確認・対応不要】公開お問い合わせフォームの機能確認です。識別子: ${token}。実際の問い合わせではありません。`
+            );
+
+            const radioSelector = 'input[name="wpforms[fields][4]"]';
+            const radios = page.locator(radioSelector);
+            const radioCount = await radios.count();
+            let checked = false;
+            for (let i = 0; i < radioCount; i++) {
+              const radio = radios.nth(i);
+              const id = await radio.getAttribute('id');
+              const value = await radio.getAttribute('value') || '';
+              const label = id ? page.locator(`label[for="${id}"]`) : null;
+              const labelText = label && await label.count() ? await label.first().innerText() : '';
+              if (/メール|mail/i.test(`${value} ${labelText}`)) {
+                await radio.check();
+                console.log(`CHECKED_RADIO value=${value} label=${labelText}`);
+                checked = true;
+                break;
+              }
+            }
+            if (!checked && radioCount > 0) {
+              await radios.first().check();
+              console.log(`CHECKED_RADIO first value=${await radios.first().getAttribute('value')}`);
+            }
+
+            const visibleValues = await form.locator('input:not([type="hidden"]), textarea, select').evaluateAll(nodes => nodes.map(node => ({
+              id: node.id,
+              name: node.getAttribute('name'),
+              type: node.getAttribute('type'),
+              value: node.type === 'password' ? '[redacted]' : node.value,
+              checked: node.checked,
+            })));
+            console.log(`VISIBLE_VALUES ${JSON.stringify(visibleValues)}`);
+
+            await page.screenshot({ path: '/tmp/before-submit.png', fullPage: true });
+
+            const submit = page.locator('#wpforms-submit-7052');
+            await submit.scrollIntoViewIfNeeded();
+            console.log(`SUBMIT enabled=${await submit.isEnabled()} visible=${await submit.isVisible()}`);
+
+            await submit.click({ timeout: 30000 });
+            await page.waitForTimeout(12000);
+
+            const confirmationSelectors = [
+              '#wpforms-confirmation-7052',
+              '.wpforms-confirmation-container-full',
+              '.wpforms-confirmation-container',
+            ];
+            const confirmations = [];
+            for (const selector of confirmationSelectors) {
+              const locator = page.locator(selector);
+              const count = await locator.count();
+              for (let i = 0; i < count; i++) {
+                if (await locator.nth(i).isVisible()) {
+                  confirmations.push({ selector, text: (await locator.nth(i).innerText()).trim() });
+                }
+              }
+            }
+
+            const errorSelectors = [
+              '#wpforms-form-7052 .wpforms-error',
+              '#wpforms-form-7052 [role="alert"]',
+              '#wpforms-form-7052 .wpforms-field-limit-text',
+              '#wpforms-form-7052 .wpforms-process-error',
+            ];
+            const errors = [];
+            for (const selector of errorSelectors) {
+              const locator = page.locator(selector);
+              const count = await locator.count();
+              for (let i = 0; i < count; i++) {
+                if (await locator.nth(i).isVisible()) {
+                  errors.push({ selector, text: (await locator.nth(i).innerText()).trim() });
+                }
+              }
+            }
+
+            let formText = '';
+            if (await form.count()) {
+              formText = (await form.innerText()).replace(/\s+/g, ' ').trim().slice(0, 4000);
+            }
+            console.log(`CONFIRMATIONS ${JSON.stringify(confirmations)}`);
+            console.log(`ERRORS ${JSON.stringify(errors)}`);
+            console.log(`FORM_TEXT_AFTER ${formText}`);
+            console.log(`RELEVANT_RESPONSES ${JSON.stringify(relevantResponses)}`);
+            console.log(`TEST_TOKEN=${token}`);
+
+            await page.screenshot({ path: '/tmp/after-submit.png', fullPage: true });
+            fs.writeFileSync('/tmp/result.json', JSON.stringify({ token, confirmations, errors, formText, relevantResponses }, null, 2));
+
+            if (!confirmations.length) {
+              process.exitCode = 1;
+            }
+          } finally {
+            await browser.close();
           }
+          JS
+          node /tmp/test_form.mjs
 
-          session = requests.Session()
-          session.headers.update(headers)
-          response = session.get(PAGE_URL, timeout=30)
-          print(f"GET status={response.status_code} final_url={response.url}")
-          response.raise_for_status()
-
-          soup = BeautifulSoup(response.text, "html.parser")
-          forms = soup.find_all("form")
-          print(f"forms_found={len(forms)}")
-          form = None
-          for candidate in forms:
-              marker = " ".join([
-                  str(candidate.get("id", "")),
-                  " ".join(candidate.get("class", [])),
-                  str(candidate.get("data-formid", "")),
-              ]).lower()
-              if "wpforms" in marker:
-                  form = candidate
-                  break
-          if form is None and forms:
-              form = forms[0]
-          if form is None:
-              print("ERROR: no form element found")
-              sys.exit(2)
-
-          action_url = urljoin(response.url, form.get("action") or response.url)
-          method = (form.get("method") or "post").lower()
-          print(f"selected_form_id={form.get('id')} class={form.get('class')} method={method} action={action_url}")
-          print("form_data_attributes=" + json.dumps({k: v for k, v in form.attrs.items() if k.startswith("data-")}, ensure_ascii=False))
-
-          payload = {}
-          field_manifest = []
-
-          def infer_value(name, element_id, placeholder, input_type):
-              haystack = " ".join([name or "", element_id or "", placeholder or ""]).lower()
-              if input_type == "email" or "mail" in haystack:
-                  return "info@bigframe.jp"
-              if input_type == "tel" or any(key in haystack for key in ["phone", "tel", "電話"]):
-                  return "070-4495-8161"
-              if any(key in haystack for key in ["name", "名前", "氏名"]):
-                  return "BigFrameフォーム動作確認"
-              return f"動作確認 {token}"
-
-          for element in form.find_all(["input", "textarea", "select", "button"]):
-              tag = element.name
-              name = element.get("name")
-              if not name:
-                  continue
-              input_type = (element.get("type") or "").lower()
-              element_id = element.get("id") or ""
-              placeholder = element.get("placeholder") or ""
-
-              if tag == "input":
-                  if input_type in {"submit", "button", "image", "file", "reset"}:
-                      if input_type == "submit" and element.get("value"):
-                          payload[name] = element.get("value")
-                      continue
-                  if input_type in {"checkbox", "radio"}:
-                      if name not in payload and not element.has_attr("disabled"):
-                          payload[name] = element.get("value", "1")
-                      continue
-                  if input_type == "hidden":
-                      payload[name] = element.get("value", "")
-                  else:
-                      payload[name] = infer_value(name, element_id, placeholder, input_type)
-              elif tag == "textarea":
-                  payload[name] = (
-                      "【自動動作確認・対応不要】公開お問い合わせフォームの機能確認です。"
-                      f"識別子: {token}。実際の問い合わせではありません。"
-                  )
-              elif tag == "select":
-                  options = element.find_all("option")
-                  selected = next((o for o in options if o.has_attr("selected") and o.get("value", "") != ""), None)
-                  if selected is None:
-                      selected = next((o for o in options if o.get("value", "") != "" and not o.has_attr("disabled")), None)
-                  if selected is not None:
-                      payload[name] = selected.get("value", selected.get_text(strip=True))
-              elif tag == "button" and input_type == "submit" and element.get("value"):
-                  payload[name] = element.get("value")
-
-              field_manifest.append({
-                  "tag": tag,
-                  "type": input_type,
-                  "name": name,
-                  "id": element_id,
-                  "required": element.has_attr("required") or element.get("aria-required") == "true",
-              })
-
-          # Prefer email for a contact-method radio/select when a matching value exists.
-          for radio in form.find_all("input", {"type": "radio"}):
-              name = radio.get("name")
-              value = radio.get("value", "")
-              label_text = ""
-              if radio.get("id"):
-                  label = form.find("label", attrs={"for": radio.get("id")})
-                  if label:
-                      label_text = label.get_text(" ", strip=True)
-              if name and ("mail" in value.lower() or "メール" in value or "メール" in label_text):
-                  payload[name] = value
-
-          # WPForms AJAX normally adds this client-side. Supplying it is harmless for normal POST.
-          ajax_submit = str(form.get("data-ajax_submit", "")).lower() in {"1", "true", "yes"}
-          if ajax_submit:
-              payload.setdefault("action", "wpforms_submit")
-
-          print("field_manifest=" + json.dumps(field_manifest, ensure_ascii=False))
-          print("payload_keys=" + json.dumps(sorted(payload.keys()), ensure_ascii=False))
-          print(f"ajax_submit={ajax_submit}")
-
-          submit_url = action_url
-          if ajax_submit:
-              # WPForms exposes the AJAX URL in page scripts. Use it when discoverable.
-              ajax_match = re.search(r'ajaxurl["\']?\s*[:=]\s*["\']([^"\']+)', response.text)
-              if ajax_match:
-                  submit_url = urljoin(response.url, ajax_match.group(1).replace(r"\/", "/"))
-              elif "admin-ajax.php" in response.text:
-                  admin_match = re.search(r'https?://[^"\']+/wp-admin/admin-ajax\.php', response.text)
-                  if admin_match:
-                      submit_url = admin_match.group(0)
-              else:
-                  submit_url = urljoin(response.url, "/wp-admin/admin-ajax.php")
-
-          print(f"POST url={submit_url}")
-          post_headers = {"Referer": response.url, "Origin": "https://bigframe.jp"}
-          submitted = session.post(submit_url, data=payload, headers=post_headers, timeout=60, allow_redirects=True)
-          print(f"POST status={submitted.status_code} final_url={submitted.url} content_type={submitted.headers.get('content-type')}")
-          print("response_excerpt=" + re.sub(r"\s+", " ", submitted.text[:4000]))
-
-          body_lower = submitted.text.lower()
-          success_markers = [
-              "wpforms-confirmation",
-              "ありがとうございます",
-              "送信されました",
-              "success\":true",
-              '"success":true',
-          ]
-          error_markers = [
-              "wpforms-error",
-              "送信に失敗",
-              "必須項目",
-              "invalid",
-              '"success":false',
-          ]
-          print("success_markers_found=" + json.dumps([m for m in success_markers if m in body_lower or m in submitted.text], ensure_ascii=False))
-          print("error_markers_found=" + json.dumps([m for m in error_markers if m in body_lower or m in submitted.text], ensure_ascii=False))
-          print(f"TEST_TOKEN={token}")
-
-          if submitted.status_code >= 400:
-              sys.exit(3)
-          PY
-          python /tmp/test_form.py
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bigframe-form-browser-test-${{ github.run_id }}
+          path: |
+            /tmp/before-submit.png
+            /tmp/after-submit.png
+            /tmp/result.json
+          if-no-files-found: warn
+          retention-days: 7
