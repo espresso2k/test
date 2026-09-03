@@ -1,4 +1,4 @@
-name: BigFrame contact form headed-browser test
+name: BigFrame reCAPTCHA loader diagnostic
 
 on:
   push:
@@ -10,91 +10,43 @@ permissions:
   contents: read
 
 jobs:
-  test-contact-form:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Install Playwright
         run: |
           npm install --no-save playwright
           npx playwright install --with-deps chromium
 
-      - name: Submit form with normal browser interaction
-        env:
-          TEST_TOKEN: BF-FORM-20260904-HEADED-${{ github.run_id }}
+      - name: Inspect scripts and loaded resources
         run: |
-          cat > test_form.mjs <<'JS'
+          cat > inspect.mjs <<'JS'
           import { chromium } from 'playwright';
-          import fs from 'node:fs';
-
-          const token = process.env.TEST_TOKEN;
-          const browser = await chromium.launch({ headless: false });
-          const context = await browser.newContext({
-            locale: 'ja-JP',
-            timezoneId: 'Asia/Tokyo',
-            viewport: { width: 1365, height: 900 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
-          });
-          const page = await context.newPage();
-          const ajax = [];
-          page.on('pageerror', e => console.log(`PAGE_ERROR ${e.message}`));
-          page.on('response', async r => {
-            if (r.url().includes('/wp-admin/admin-ajax.php')) {
-              let text = '';
-              try { text = (await r.text()).replace(/\s+/g, ' ').slice(0, 5000); } catch {}
-              ajax.push({ status: r.status(), text });
-              console.log(`AJAX ${r.status()} ${text}`);
-            }
-          });
-
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
           try {
             await page.goto('https://bigframe.jp/inq/', { waitUntil: 'networkidle', timeout: 60000 });
-            await page.waitForTimeout(7000);
-            await page.mouse.move(150, 120, { steps: 12 });
-            await page.mouse.wheel(0, 700);
-            await page.waitForTimeout(1800);
-
-            const type = async (selector, value) => {
-              const el = page.locator(selector);
-              await el.click();
-              await el.pressSequentially(value, { delay: 65 });
-              await page.waitForTimeout(350);
-            };
-            await type('#wpforms-7052-field_1', 'BigFrameフォーム動作確認');
-            await type('#wpforms-7052-field_2', '07044958161');
-            await type('#wpforms-7052-field_3', 'info@bigframe.jp');
-            await page.locator('#wpforms-7052-field_4_2').check();
-            await type('#wpforms-7052-field_5', `【動作確認・対応不要】識別子 ${token}。実際の問い合わせではありません。`);
-            await page.waitForTimeout(9000);
-
-            console.log(`VALID ${await page.locator('#wpforms-form-7052').evaluate(f => f.checkValidity())}`);
-            await page.screenshot({ path: 'before.png', fullPage: true });
-            await page.locator('#wpforms-submit-7052').click();
-            await page.waitForTimeout(18000);
-
-            const confirmations = await page.locator('#wpforms-confirmation-7052, .wpforms-confirmation-container')
-              .evaluateAll(nodes => nodes.filter(n => n.offsetParent !== null).map(n => n.innerText.trim()));
-            const errors = await page.locator('#wpforms-form-7052 .wpforms-error, #wpforms-form-7052 [role="alert"]')
-              .evaluateAll(nodes => nodes.filter(n => n.offsetParent !== null).map(n => n.innerText.trim()));
-            console.log(`CONFIRMATIONS ${JSON.stringify(confirmations)}`);
-            console.log(`ERRORS ${JSON.stringify(errors)}`);
-            console.log(`TOKEN ${token}`);
-            await page.screenshot({ path: 'after.png', fullPage: true });
-            fs.writeFileSync('result.json', JSON.stringify({ token, confirmations, errors, ajax }, null, 2));
+            await page.waitForTimeout(3000);
+            const scripts = await page.locator('script').evaluateAll(nodes => nodes.map((s, index) => ({
+              index,
+              id: s.id || '',
+              src: s.src || '',
+              type: s.type || '',
+              data: Object.fromEntries([...s.attributes].filter(a => a.name.startsWith('data-')).map(a => [a.name, a.value])),
+              inlineExcerpt: s.src ? '' : (s.textContent || '').replace(/\s+/g, ' ').slice(0, 500)
+            })).filter(x => /recaptcha|captcha|wpforms/i.test(`${x.id} ${x.src} ${x.inlineExcerpt}`))));
+            const resources = await page.evaluate(() => performance.getEntriesByType('resource')
+              .map(x => x.name)
+              .filter(x => /recaptcha|captcha/i.test(x)));
+            const pluginAssets = await page.evaluate(() => performance.getEntriesByType('resource')
+              .map(x => x.name)
+              .filter(x => /\/wp-content\/(plugins|themes)\//.test(x)));
+            console.log('RELEVANT_SCRIPT_TAGS=' + JSON.stringify(scripts, null, 2));
+            console.log('CAPTCHA_RESOURCES=' + JSON.stringify(resources, null, 2));
+            console.log('PLUGIN_THEME_ASSETS=' + JSON.stringify([...new Set(pluginAssets)].sort(), null, 2));
           } finally {
             await browser.close();
           }
           JS
-          xvfb-run -a node ./test_form.mjs
-
-      - name: Upload evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bigframe-form-headed-${{ github.run_id }}
-          path: |
-            before.png
-            after.png
-            result.json
-          if-no-files-found: warn
-          retention-days: 7
+          node inspect.mjs
