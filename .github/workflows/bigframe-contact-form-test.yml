@@ -1,4 +1,4 @@
-name: BigFrame reCAPTCHA loader diagnostic
+name: BigFrame WordPress repair-access diagnostic
 
 on:
   push:
@@ -10,43 +10,82 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  inspect-wordpress-access:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      WP_URL: ${{ secrets.WP_URL }}
+      WP_USER: ${{ secrets.WP_USER }}
+      WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
     steps:
-      - name: Install Playwright
+      - name: Test stored WordPress application-password access
+        shell: bash
         run: |
-          npm install --no-save playwright
-          npx playwright install --with-deps chromium
+          set +x
+          present_url=false; present_user=false; present_pass=false
+          [ -n "$WP_URL" ] && present_url=true
+          [ -n "$WP_USER" ] && present_user=true
+          [ -n "$WP_APP_PASS" ] && present_pass=true
+          echo "SECRET_PRESENCE WP_URL=$present_url WP_USER=$present_user WP_APP_PASS=$present_pass"
+          if [ "$present_url" != true ] || [ "$present_user" != true ] || [ "$present_pass" != true ]; then
+            echo "No complete stored WordPress credential set is available in this repository."
+            exit 0
+          fi
 
-      - name: Inspect scripts and loaded resources
-        run: |
-          cat > inspect.mjs <<'JS'
-          import { chromium } from 'playwright';
-          const browser = await chromium.launch({ headless: true });
-          const page = await browser.newPage();
-          try {
-            await page.goto('https://bigframe.jp/inq/', { waitUntil: 'networkidle', timeout: 60000 });
-            await page.waitForTimeout(3000);
-            const scripts = await page.locator('script').evaluateAll(nodes => nodes.map((s, index) => ({
-              index,
-              id: s.id || '',
-              src: s.src || '',
-              type: s.type || '',
-              data: Object.fromEntries([...s.attributes].filter(a => a.name.startsWith('data-')).map(a => [a.name, a.value])),
-              inlineExcerpt: s.src ? '' : (s.textContent || '').replace(/\s+/g, ' ').slice(0, 500)
-            })).filter(x => /recaptcha|captcha|wpforms/i.test(`${x.id} ${x.src} ${x.inlineExcerpt}`))));
-            const resources = await page.evaluate(() => performance.getEntriesByType('resource')
-              .map(x => x.name)
-              .filter(x => /recaptcha|captcha/i.test(x)));
-            const pluginAssets = await page.evaluate(() => performance.getEntriesByType('resource')
-              .map(x => x.name)
-              .filter(x => /\/wp-content\/(plugins|themes)\//.test(x)));
-            console.log('RELEVANT_SCRIPT_TAGS=' + JSON.stringify(scripts, null, 2));
-            console.log('CAPTCHA_RESOURCES=' + JSON.stringify(resources, null, 2));
-            console.log('PLUGIN_THEME_ASSETS=' + JSON.stringify([...new Set(pluginAssets)].sort(), null, 2));
-          } finally {
-            await browser.close();
-          }
-          JS
-          node inspect.mjs
+          BASE="${WP_URL%/}"
+          code=$(curl -sS -o me.json -w '%{http_code}' --user "$WP_USER:$WP_APP_PASS" \
+            "$BASE/wp-json/wp/v2/users/me?context=edit")
+          echo "AUTH_HTTP_STATUS=$code"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          try:
+              data=json.loads(Path('me.json').read_text())
+          except Exception as e:
+              print('AUTH_RESPONSE_PARSE_ERROR', type(e).__name__)
+          else:
+              if 'code' in data:
+                  print('AUTH_ERROR_CODE=' + str(data.get('code')))
+                  print('AUTH_ERROR_MESSAGE=' + str(data.get('message'))[:300])
+              else:
+                  caps=data.get('capabilities') or {}
+                  print('AUTHENTICATED_USER_ID=' + str(data.get('id')))
+                  print('AUTHENTICATED_ROLES=' + json.dumps(data.get('roles', []), ensure_ascii=False))
+                  print('CAN_EDIT_OPTIONS=' + str(bool(caps.get('manage_options'))).lower())
+                  print('CAN_INSTALL_PLUGINS=' + str(bool(caps.get('install_plugins'))).lower())
+                  print('CAN_ACTIVATE_PLUGINS=' + str(bool(caps.get('activate_plugins'))).lower())
+                  print('CAN_EDIT_FORMS=' + str(bool(caps.get('wpforms_edit_forms') or caps.get('edit_posts'))).lower())
+          PY
+
+          if [ "$code" != 200 ]; then exit 0; fi
+
+          curl -sS --user "$WP_USER:$WP_APP_PASS" "$BASE/wp-json/" -o index.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('index.json').read_text())
+          routes=sorted((data.get('routes') or {}).keys())
+          wanted=[r for r in routes if ('wpforms' in r.lower() or 'wp-abilities' in r.lower() or r in ['/wp/v2/plugins','/wp/v2/settings'])]
+          print('RELEVANT_ROUTES=' + json.dumps(wanted, ensure_ascii=False))
+          print('WORDPRESS_VERSION_HEADER_NOT_EXPOSED=true')
+          PY
+
+          pcode=$(curl -sS -o plugins.json -w '%{http_code}' --user "$WP_USER:$WP_APP_PASS" \
+            "$BASE/wp-json/wp/v2/plugins?context=edit&per_page=100")
+          echo "PLUGINS_HTTP_STATUS=$pcode"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          try: data=json.loads(Path('plugins.json').read_text())
+          except Exception as e:
+              print('PLUGINS_PARSE_ERROR', type(e).__name__)
+          else:
+              if isinstance(data, list):
+                  safe=[]
+                  for p in data:
+                      name=(p.get('name') or {}).get('rendered') if isinstance(p.get('name'),dict) else p.get('name')
+                      safe.append({'plugin':p.get('plugin'),'status':p.get('status'),'name':name,'version':p.get('version')})
+                  print('PLUGINS=' + json.dumps(safe, ensure_ascii=False))
+              else:
+                  print('PLUGINS_ERROR=' + json.dumps({'code':data.get('code'),'message':data.get('message')}, ensure_ascii=False))
+          PY
