@@ -1,4 +1,4 @@
-name: BigFrame form-plugin usage audit
+name: BigFrame rendered-form audit
 
 on:
   push:
@@ -14,96 +14,122 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Crawl public sitemaps and identify form plugin usage
+      - name: Crawl public pages and inspect actual form elements
         run: |
           python -m pip install --disable-pip-version-check requests beautifulsoup4
           cat > audit.py <<'PY'
-          import re
+          import json
           import xml.etree.ElementTree as ET
           from collections import deque
           from urllib.parse import urlparse
+
           import requests
+          from bs4 import BeautifulSoup, Comment
 
           BASE = 'https://bigframe.jp'
           session = requests.Session()
-          session.headers['User-Agent'] = 'Mozilla/5.0 BigFrameFormAudit/1.0'
+          session.headers['User-Agent'] = 'Mozilla/5.0 BigFrameRenderedFormAudit/1.0'
+          queue = deque([BASE + '/wp-sitemap.xml', BASE + '/sitemap_index.xml'])
+          seen = set()
+          urls = {BASE + '/', BASE + '/inq/'}
 
-          sitemap_queue = deque([BASE + '/wp-sitemap.xml', BASE + '/sitemap_index.xml'])
-          seen_sitemaps = set()
-          urls = set([BASE + '/', BASE + '/inq/'])
-
-          while sitemap_queue and len(seen_sitemaps) < 50:
-              sm = sitemap_queue.popleft()
-              if sm in seen_sitemaps:
+          while queue and len(seen) < 50:
+              sm = queue.popleft()
+              if sm in seen:
                   continue
-              seen_sitemaps.add(sm)
+              seen.add(sm)
               try:
                   r = session.get(sm, timeout=25)
                   if r.status_code != 200 or '<loc>' not in r.text:
                       continue
                   root = ET.fromstring(r.content)
-                  locs = [e.text.strip() for e in root.iter() if e.tag.endswith('loc') and e.text]
-                  for loc in locs:
+                  for node in root.iter():
+                      if not node.tag.endswith('loc') or not node.text:
+                          continue
+                      loc = node.text.strip()
                       if urlparse(loc).netloc not in {'bigframe.jp', 'www.bigframe.jp'}:
                           continue
                       if loc.lower().endswith('.xml'):
-                          sitemap_queue.append(loc)
+                          queue.append(loc)
                       else:
                           urls.add(loc)
               except Exception as exc:
-                  print(f'SITEMAP_ERROR {sm} {type(exc).__name__}: {exc}')
+                  print('SITEMAP_ERROR', sm, type(exc).__name__, str(exc))
 
-          print(f'SITEMAPS_SCANNED={len(seen_sitemaps)} URLS_DISCOVERED={len(urls)}')
-          wpforms_pages = []
-          wpzoom_pages = []
-          wpzoom_asset_only_pages = []
+          page_records = []
           failures = []
-
-          wpforms_patterns = [r'id=["\']wpforms-form-', r'class=["\'][^"\']*wpforms-form', r'wpforms\[fields\]']
-          wpzoom_markup_patterns = [
-              r'id=["\'][^"\']*wpzoom[^"\']*form',
-              r'class=["\'][^"\']*(?:wpzoom-form|wpz-form|wpzoom_forms)',
-              r'name=["\']wpzoom',
-              r'data-(?:wpzoom|wpz)[^=]*=',
-          ]
-
-          for i, url in enumerate(sorted(urls), 1):
+          for url in sorted(urls):
               try:
                   r = session.get(url, timeout=25, allow_redirects=True)
-                  ctype = r.headers.get('content-type', '')
-                  if r.status_code != 200 or 'text/html' not in ctype:
+                  if r.status_code != 200 or 'text/html' not in r.headers.get('content-type', ''):
                       continue
-                  html = r.text
-                  low = html.lower()
-                  has_wpforms = any(re.search(p, html, re.I) for p in wpforms_patterns)
-                  has_wpzoom_markup = any(re.search(p, html, re.I) for p in wpzoom_markup_patterns)
-                  has_wpzoom_assets = '/wp-content/plugins/wpzoom-forms/' in low
-                  if has_wpforms:
-                      ids = sorted(set(re.findall(r'wpforms-form-(\d+)', html, re.I)))
-                      wpforms_pages.append((url, ids))
-                  if has_wpzoom_markup:
-                      excerpts = []
-                      for p in wpzoom_markup_patterns:
-                          m = re.search(p, html, re.I)
-                          if m:
-                              excerpts.append(html[max(0,m.start()-100):m.end()+250].replace('\n',' ')[:400])
-                      wpzoom_pages.append((url, excerpts[:3]))
-                  elif has_wpzoom_assets:
-                      wpzoom_asset_only_pages.append(url)
-              except Exception as exc:
-                  failures.append((url, f'{type(exc).__name__}: {exc}'))
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  forms = []
+                  for form in soup.find_all('form'):
+                      signature = ' '.join([
+                          form.get('id', ''),
+                          ' '.join(form.get('class', [])),
+                          form.get('action', ''),
+                          form.get('method', ''),
+                      ])
+                      controls = []
+                      for c in form.find_all(['input', 'textarea', 'select', 'button']):
+                          controls.append({
+                              'tag': c.name,
+                              'type': c.get('type', ''),
+                              'name': c.get('name', ''),
+                              'id': c.get('id', ''),
+                          })
+                      forms.append({
+                          'id': form.get('id', ''),
+                          'class': form.get('class', []),
+                          'action': form.get('action', ''),
+                          'method': form.get('method', ''),
+                          'signature': signature,
+                          'controls': controls[:30],
+                      })
 
-          print('WPFORMS_PAGES_BEGIN')
-          for url, ids in wpforms_pages:
-              print(url, 'FORM_IDS=' + ','.join(ids))
-          print('WPFORMS_PAGES_END')
-          print('WPZOOM_MARKUP_PAGES_BEGIN')
-          for url, excerpts in wpzoom_pages:
-              print(url, 'EXCERPTS=' + repr(excerpts))
-          print('WPZOOM_MARKUP_PAGES_END')
-          print('WPZOOM_ASSET_ONLY_COUNT=' + str(len(wpzoom_asset_only_pages)))
-          print('WPZOOM_ASSET_ONLY_SAMPLE=' + repr(wpzoom_asset_only_pages[:20]))
-          print('FAILURES=' + repr(failures[:20]))
-          print(f'SUMMARY wpforms_pages={len(wpforms_pages)} wpzoom_markup_pages={len(wpzoom_pages)} wpzoom_asset_only_pages={len(wpzoom_asset_only_pages)}')
+                  comments = [str(c) for c in soup.find_all(string=lambda t: isinstance(t, Comment))]
+                  wpzoom_block_comments = [c[:500] for c in comments if 'wpzoom' in c.lower() and 'form' in c.lower()]
+                  wpzoom_shortcodes = []
+                  low = r.text.lower()
+                  for marker in ('[wpzoom_form', '[wpzoom-form', 'wp:wpzoom-forms', 'wpzoom/forms'):
+                      if marker in low:
+                          wpzoom_shortcodes.append(marker)
+
+                  rec = {
+                      'url': url,
+                      'forms': forms,
+                      'has_wpforms_form': any('wpforms' in f['signature'].lower() for f in forms),
+                      'has_wpzoom_form_element': any(('wpzoom' in f['signature'].lower() or 'wpz-' in f['signature'].lower()) for f in forms),
+                      'wpzoom_block_comments': wpzoom_block_comments,
+                      'wpzoom_shortcodes': wpzoom_shortcodes,
+                      'loads_wpzoom_forms_assets': '/wp-content/plugins/wpzoom-forms/' in low,
+                      'loads_wpforms_assets': '/wp-content/plugins/wpforms-lite/' in low,
+                  }
+                  page_records.append(rec)
+              except Exception as exc:
+                  failures.append({'url': url, 'error': f'{type(exc).__name__}: {exc}'})
+
+          pages_with_any_form = [r for r in page_records if r['forms']]
+          wpforms_pages = [r['url'] for r in page_records if r['has_wpforms_form']]
+          wpzoom_form_pages = [r['url'] for r in page_records if r['has_wpzoom_form_element'] or r['wpzoom_block_comments'] or r['wpzoom_shortcodes']]
+          wpzoom_asset_pages = [r['url'] for r in page_records if r['loads_wpzoom_forms_assets']]
+
+          print('URL_COUNT=' + str(len(page_records)))
+          print('PAGES_WITH_ANY_FORM=' + json.dumps(pages_with_any_form, ensure_ascii=False))
+          print('WPFORMS_PAGES=' + json.dumps(wpforms_pages, ensure_ascii=False))
+          print('WPZOOM_ACTUAL_FORM_PAGES=' + json.dumps(wpzoom_form_pages, ensure_ascii=False))
+          print('WPZOOM_ASSET_PAGE_COUNT=' + str(len(wpzoom_asset_pages)))
+          print('WPZOOM_ASSET_PAGES=' + json.dumps(wpzoom_asset_pages, ensure_ascii=False))
+          print('FAILURES=' + json.dumps(failures, ensure_ascii=False))
+          print('SUMMARY=' + json.dumps({
+              'scanned_pages': len(page_records),
+              'pages_with_any_form': len(pages_with_any_form),
+              'wpforms_pages': len(wpforms_pages),
+              'wpzoom_actual_form_pages': len(wpzoom_form_pages),
+              'wpzoom_asset_pages': len(wpzoom_asset_pages),
+              'failures': len(failures),
+          }, ensure_ascii=False))
           PY
           python audit.py
